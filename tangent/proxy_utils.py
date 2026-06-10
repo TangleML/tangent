@@ -49,6 +49,10 @@ async def proxy_request_for_instance(
             status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Instance pod is not yet running",
         )
+
+    query_string = request.url.query
+    if query_string:
+        path = path + "?" + query_string
     return await _proxy_request_impl(
         request=request,
         pod_namespace=kubernetes_namespace,

@@ -63,6 +63,9 @@ def build_api_router(
                 status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Instance pod is not yet running",
             )
+        query_string = request.url.query
+        if query_string:
+            path = path + "?" + query_string
         return await kubernetes_proxy_utils.proxy_http(
             request=request,
             http_client=http_client,
@@ -102,6 +105,10 @@ def build_api_router(
                 status_code=fastapi.status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Instance pod is not yet running",
             )
+        query_string = websocket.url.query
+        if query_string:
+            path = path + "?" + query_string
+
         return await kubernetes_proxy_utils.proxy_websocket(
             websocket=websocket,
             kubernetes_server_info=kubernetes_server_info,
