@@ -444,6 +444,7 @@ def _build_opencode_agent_container(
             name="tangent-data",
             mount_path="/root/workspace/memory.read_only/",
             sub_path_expr="user_data/memory/by_instance/",
+            read_only=True,
         ),
         k8s_client_lib.V1VolumeMount(
             name="tangent-data",
