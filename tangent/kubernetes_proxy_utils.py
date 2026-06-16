@@ -10,8 +10,10 @@ import ssl
 
 import httpx
 import websockets
+from kubernetes import client as k8s_client_lib
 from kubernetes import config as k8s_config_lib
 from kubernetes.client import configuration as k8s_client_config_lib
+from kubernetes.stream import portforward as k8s_portforward
 from starlette import background, requests, responses
 from starlette import websockets as starlette_websockets
 from websockets import exceptions as ws_exceptions
@@ -60,9 +62,7 @@ class KubernetesApiServerInfo:
         # auth_settings calls get_api_key_with_prefix which triggers refresh_api_key_hook (if set by load_kube_config)
         # which handles token expiry for exec-based providers (gke-gcloud-auth-plugin, OIDC, etc.)
         auth_settings = self._kubernetes_configuration.auth_settings()
-        bearer_auth_info = auth_settings.get(
-            "BearerToken"
-        )
+        bearer_auth_info = auth_settings.get("BearerToken")
         if bearer_auth_info:
             # Usually, bearer_auth_info["key"] == "authorization"
             return {bearer_auth_info["key"]: bearer_auth_info["value"]}
@@ -208,6 +208,88 @@ async def proxy_websocket(
     async with upstream:
         await websocket.accept(subprotocol=upstream.subprotocol)
         await _pipe_websockets_bidirectionally(websocket, upstream)
+
+
+async def port_forward_websocket(
+    websocket: starlette_websockets.WebSocket,
+    api_client: k8s_client_lib.ApiClient,
+    namespace: str,
+    pod: str,
+    port: int,
+    path_and_query_string: str,
+    scheme: str = "ws",
+    host: str = "localhost",
+) -> None:
+    """Bridge a client WebSocket to the Pod's WebSocket.
+
+    This routes through the API-server `portforward` subresource (a raw TCP
+    tunnel) rather than the `pods/proxy` subresource. The proxy subresource
+    strips the request query string when proxying a WebSocket upgrade, which
+    breaks clients like socket.io that carry essential params (EIO, transport,
+    sid) in the query string. portforward gives a transparent byte stream, so
+    the upgrade request reaches the Pod unmodified.
+
+    `scheme`/`host` only shape the upgrade request, not the transport (see the
+    URI note below). They default to plaintext loopback, which is correct for
+    every current agent type; they are exposed as parameters so a future agent
+    that needs e.g. in-pod TLS (`wss`) or strict Host validation can override
+    them without touching the proxy internals.
+    """
+    # The transport is the pre-connected `portforward` socket passed as `sock=`
+    # below, so `websockets` never resolves or dials this URI. The URI only
+    # supplies: the scheme (`ws` = plaintext, which is correct because the Pod
+    # serves plain HTTP/WS on its container port and TLS terminates upstream at
+    # the API server), the `Host:` header (`localhost:{port}` is a placeholder
+    # authority matching how the agent, bound to 0.0.0.0, is reached in-pod),
+    # and the request path. We preserve the original path + query so socket.io's
+    # upgrade params survive.
+    uri = f"{scheme}://{host}:{port}/{path_and_query_string.lstrip('/')}"
+    subprotocols = websocket.scope.get("subprotocols") or None
+
+    core_v1 = k8s_client_lib.CoreV1Api(api_client=api_client)
+
+    # Establishing the portforward opens a (blocking) WebSocket to the API server
+    # and spins up a pump thread; run it off the event loop.
+    try:
+        port_forward = await asyncio.to_thread(
+            k8s_portforward,
+            core_v1.connect_get_namespaced_pod_portforward,
+            pod,
+            namespace,
+            ports=str(port),
+        )
+        upstream_socket = port_forward.socket(port)
+        upstream_socket.setblocking(False)
+    except Exception:
+        # Pod not ready yet, or the portforward could not be established. Reject
+        # the handshake; the browser UI retries with backoff.
+        await websocket.close(code=1011)
+        return
+
+    try:
+        upstream = await websockets.connect(
+            uri,
+            sock=upstream_socket,
+            subprotocols=subprotocols,
+            open_timeout=10,
+            max_size=None,
+            ping_interval=None,
+        )
+    except (OSError, asyncio.TimeoutError, ws_exceptions.WebSocketException):
+        # port_forward.close() is blocking (joins the pump thread / closes the
+        # API-server WebSocket), so it must run off the event loop.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(port_forward.close)
+        await websocket.close(code=1011)
+        return
+
+    try:
+        async with upstream:
+            await websocket.accept(subprotocol=upstream.subprotocol)
+            await _pipe_websockets_bidirectionally(websocket, upstream)
+    finally:
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(port_forward.close)
 
 
 async def _pipe_websockets_bidirectionally(

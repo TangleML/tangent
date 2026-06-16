@@ -109,13 +109,21 @@ def build_api_router(
         if query_string:
             path = path + "?" + query_string
 
-        return await kubernetes_proxy_utils.proxy_websocket(
+        # return await kubernetes_proxy_utils.proxy_websocket(
+        #     websocket=websocket,
+        #     kubernetes_server_info=kubernetes_server_info,
+        #     namespace=kubernetes_namespace,
+        #     pod=pod_name,
+        #     port=port,
+        #     path=path,
+        # )
+        return await kubernetes_proxy_utils.port_forward_websocket(
             websocket=websocket,
-            kubernetes_server_info=kubernetes_server_info,
+            api_client=kubernetes_client,
             namespace=kubernetes_namespace,
             pod=pod_name,
             port=port,
-            path=path,
+            path_and_query_string=path,
         )
 
     return router
