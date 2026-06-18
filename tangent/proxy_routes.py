@@ -16,6 +16,11 @@ def build_api_router(
 ) -> fastapi.APIRouter:
 
     kubernetes_configuration = kubernetes_client.configuration
+    # Workaround for non-thread-safe kubernetes.stream.portforward method that hacks ApiClient.request
+    # See https://github.com/kubernetes-client/python/blob/f8c3ba2a7be3c90f2e94ea1f655f8a589c642333/kubernetes/base/stream/stream.py#L21
+    kubernetes_client_for_ws_proxying = k8s_client_lib.ApiClient(
+        configuration=kubernetes_client.configuration
+    )
 
     kubernetes_server_info = kubernetes_proxy_utils.KubernetesApiServerInfo(
         kubernetes_configuration
@@ -119,7 +124,7 @@ def build_api_router(
         # )
         return await kubernetes_proxy_utils.port_forward_websocket(
             websocket=websocket,
-            api_client=kubernetes_client,
+            api_client=kubernetes_client_for_ws_proxying,
             namespace=kubernetes_namespace,
             pod=pod_name,
             port=port,
