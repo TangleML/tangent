@@ -78,11 +78,14 @@ _AUTH_PROXY_MITMPROXY_ADDON_PY = textwrap.dedent("""\
             url = flow.request.pretty_url
             for rule in proxy_rules:
                 url_pattern = rule["url_pattern"]
+                replacement_pattern = rule.get("replacement_pattern")
                 if (
                     url.startswith(url_pattern)
                     or url.startswith("https://" + url_pattern)
                     or url.startswith("http://" + url_pattern)
                 ):
+                    if replacement_pattern:
+                        flow.request.url = flow.request.url.replace(url_pattern, replacement_pattern)
                     for header_key, header_value in (rule.get("add_headers") or {}).items():
                         flow.request.headers[header_key] = header_value
             flow.request.headers["x-tangent-proxy"] = "true"
