@@ -246,6 +246,11 @@ async def port_forward_websocket(
     uri = f"{scheme}://{host}:{port}/{path_and_query_string.lstrip('/')}"
     subprotocols = websocket.scope.get("subprotocols") or None
 
+
+    # Workaround for non-thread-safe kubernetes.stream.portforward method that hacks ApiClient.request
+    # Example error when calling `list_namespaced_pod``: "kubernetes.client.exceptions.ApiValueError: Missing required parameter `ports`"
+    # See https://github.com/kubernetes-client/python/blob/f8c3ba2a7be3c90f2e94ea1f655f8a589c642333/kubernetes/base/stream/stream.py#L21
+    api_client = k8s_client_lib.ApiClient(configuration=api_client.configuration)
     core_v1 = k8s_client_lib.CoreV1Api(api_client=api_client)
 
     # Establishing the portforward opens a (blocking) WebSocket to the API server
