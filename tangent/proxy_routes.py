@@ -123,7 +123,7 @@ def build_api_router(
         #     port=port,
         #     path=path,
         # )
-        return await kubernetes_proxy_utils.port_forward_websocket(
+        return await kubernetes_proxy_utils.proxy_websocket_via_port_forward_using_kubernetes_lib_and_threads(
             websocket=websocket,
             api_client=kubernetes_client_for_ws_proxying,
             namespace=kubernetes_namespace,

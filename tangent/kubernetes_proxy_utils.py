@@ -192,7 +192,11 @@ async def proxy_websocket(
     port: int,
     path: str,
 ) -> None:
-    """Bridge a client WebSocket to the Pod's WebSocket through the API-server proxy."""
+    """Bridge a client WebSocket to the Pod's WebSocket through the API-server proxy.
+
+    Known issues:
+    Kubernetes API Server proxy strips query strings. See https://github.com/kubernetes/kubernetes/issues/77142
+    """
     url = _make_kubernetes_pod_proxy_ws_url(
         api_server_host=kubernetes_server_info.host,
         namespace=namespace,
@@ -224,7 +228,7 @@ async def proxy_websocket(
         await _pipe_websockets_bidirectionally(websocket, upstream)
 
 
-async def port_forward_websocket(
+async def proxy_websocket_via_port_forward_using_kubernetes_lib_and_threads(
     websocket: starlette_websockets.WebSocket,
     api_client: k8s_client_lib.ApiClient,
     namespace: str,
@@ -235,6 +239,12 @@ async def port_forward_websocket(
     host: str = "localhost",
 ) -> None:
     """Bridge a client WebSocket to the Pod's WebSocket.
+
+    Known issues:
+    * Uses threads in async code since Kubernetes client library code is synchronous.
+    * The Kubernetes client library portforward function monkey-parch the ApiCLient instance given to it during the port forwarding process.
+      This results in bad bugs for all async functions that use same shared APiClient.
+      To work around this we clone the passed ApiClient.
 
     This routes through the API-server `portforward` subresource (a raw TCP
     tunnel) rather than the `pods/proxy` subresource. The proxy subresource
