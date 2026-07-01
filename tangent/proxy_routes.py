@@ -114,6 +114,7 @@ def build_api_router(
         if query_string:
             path = path + "?" + query_string
 
+        # There are several implementation of WebSockets proxying.
         # return await kubernetes_proxy_utils.proxy_websocket(
         #     websocket=websocket,
         #     kubernetes_server_info=kubernetes_server_info,
@@ -130,6 +131,14 @@ def build_api_router(
             port=port,
             path_and_query_string=path,
         )
+        # return await kubernetes_proxy_utils.proxy_websocket_via_port_forward()
+        #     websocket=websocket,
+        #     kubernetes_server_info=kubernetes_server_info,
+        #     namespace=kubernetes_namespace,
+        #     pod=pod_name,
+        #     port=port,
+        #     path_and_query_string=path,
+        # )
 
     return router
 

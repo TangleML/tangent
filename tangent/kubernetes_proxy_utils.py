@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import socket
 import ssl
 
 import httpx
@@ -92,6 +93,19 @@ def _make_kubernetes_pod_proxy_ws_url(
     elif api_server_host.startswith("http://"):
         api_server_host = "ws://" + api_server_host.removeprefix("http://")
     return f"{api_server_host}{_make_kubernetes_pod_proxy_uri_path(namespace, pod, port, path)}"
+
+
+def _make_kubernetes_pod_portforward_ws_url(
+    api_server_host: str, namespace: str, pod: str, port: int
+) -> str:
+    if api_server_host.startswith("https://"):
+        api_server_host = "wss://" + api_server_host.removeprefix("https://")
+    elif api_server_host.startswith("http://"):
+        api_server_host = "ws://" + api_server_host.removeprefix("http://")
+    return (
+        f"{api_server_host}/api/v1/namespaces/{namespace}/pods/{pod}"
+        f"/portforward?ports={port}"
+    )
 
 
 # Headers that are connection-specific and must not be forwarded verbatim.
@@ -295,6 +309,195 @@ async def port_forward_websocket(
     finally:
         with contextlib.suppress(Exception):
             await asyncio.to_thread(port_forward.close)
+
+
+# Proxying the WebSockets via Kubernetes' `portforward` sub-resource.
+
+# The API-server `portforward` sub-resource is itself a WebSocket using the
+# `v4.channel.k8s.io` channel protocol: every binary message is prefixed with a
+# single channel byte. For the single port we forward, channel 0 is the
+# bidirectional data stream and channel 1 is a read-only error stream. The API
+# server opens each channel with one initial frame whose payload is the 2-byte
+# (little-endian) port number; those confirmation frames carry no tunnel data.
+_PORTFORWARD_SUBPROTOCOL = "v4.channel.k8s.io"
+_PORTFORWARD_DATA_CHANNEL = 0
+_PORTFORWARD_ERROR_CHANNEL = 1
+_PORTFORWARD_READ_CHUNK_BYTES = 65536
+
+
+async def proxy_websocket_via_port_forward(
+    websocket: starlette_websockets.WebSocket,
+    kubernetes_server_info: KubernetesApiServerInfo,
+    namespace: str,
+    pod: str,
+    port: int,
+    path_and_query_string: str,
+    scheme: str = "ws",
+    host: str = "localhost",
+) -> None:
+    """Bridge a client WebSocket to the Pod's WebSocket.
+
+    This routes through the API-server `portforward` subresource (a raw TCP
+    tunnel) rather than the `pods/proxy` subresource. The proxy subresource
+    strips the request query string when proxying a WebSocket upgrade, which
+    breaks clients like socket.io that carry essential params (EIO, transport,
+    sid) in the query string. portforward gives a transparent byte stream, so
+    the upgrade request reaches the Pod unmodified.
+
+    The portforward subresource is itself a WebSocket (the `v4.channel.k8s.io`
+    channel protocol), so the whole bridge runs on the event loop with no
+    threads or blocking calls: we open that WebSocket with `websockets.connect`,
+    expose its data channel as one end of a `socketpair`, and run the inner
+    WebSocket client over the other end via `websockets.connect(sock=...)`. Two
+    async pump tasks move bytes between the socketpair and the data channel,
+    adding/stripping the channel-framing byte.
+
+    `scheme`/`host` only shape the upgrade request, not the transport (see the
+    URI note below). They default to plaintext loopback, which is correct for
+    every current agent type; they are exposed as parameters so a future agent
+    that needs e.g. in-pod TLS (`wss`) or strict Host validation can override
+    them without touching the proxy internals.
+    """
+    portforward_url = _make_kubernetes_pod_portforward_ws_url(
+        api_server_host=kubernetes_server_info.host,
+        namespace=namespace,
+        pod=pod,
+        port=port,
+    )
+    ssl_ctx = (
+        kubernetes_server_info.ssl_context
+        if portforward_url.startswith("wss")
+        else None
+    )
+
+    # Open the portforward tunnel: an async WebSocket to the API server. This
+    # replaces the kubernetes client's thread-based `portforward` helper.
+    try:
+        tunnel = await websockets.connect(
+            portforward_url,
+            ssl=ssl_ctx,
+            additional_headers=kubernetes_server_info.get_auth_headers() or None,
+            subprotocols=[_PORTFORWARD_SUBPROTOCOL],
+            open_timeout=10,
+            max_size=None,
+            ping_interval=None,
+        )
+    except (OSError, asyncio.TimeoutError, ws_exceptions.WebSocketException):
+        # Pod not ready yet, or the portforward could not be established. Reject
+        # the handshake; the browser UI retries with backoff.
+        await websocket.close(code=1011)
+        return
+
+    # The transport for the inner WebSocket is the pre-connected `socketpair` end
+    # passed as `sock=` below, so `websockets` never resolves or dials this URI.
+    # The URI only supplies: the scheme (`ws` = plaintext, which is correct
+    # because the Pod serves plain HTTP/WS on its container port and TLS
+    # terminates upstream at the API server), the `Host:` header
+    # (`localhost:{port}` is a placeholder authority matching how the agent,
+    # bound to 0.0.0.0, is reached in-pod), and the request path. We preserve the
+    # original path + query so socket.io's upgrade params survive.
+    uri = f"{scheme}://{host}:{port}/{path_and_query_string.lstrip('/')}"
+    subprotocols = websocket.scope.get("subprotocols") or None
+
+    async with tunnel:
+        # `tunnel_side` is driven by the pump tasks; `ws_side` is handed to the
+        # inner `websockets` client. `socket.close()` is idempotent, so closing
+        # both ends in `finally` is safe even after the inner connection has
+        # already taken ownership of and closed `ws_side`.
+        tunnel_side, ws_side = socket.socketpair()
+        try:
+            tunnel_side.setblocking(False)
+            ws_side.setblocking(False)
+            pumps = asyncio.gather(
+                _pump_local_socket_to_tunnel(tunnel_side, tunnel),
+                _pump_tunnel_to_local_socket(tunnel, tunnel_side),
+            )
+            try:
+                try:
+                    upstream = await websockets.connect(
+                        uri,
+                        sock=ws_side,
+                        subprotocols=subprotocols,
+                        open_timeout=10,
+                        max_size=None,
+                        ping_interval=None,
+                    )
+                except (
+                    OSError,
+                    asyncio.TimeoutError,
+                    ws_exceptions.WebSocketException,
+                ):
+                    # Pod not ready yet, or upstream refused the upgrade.
+                    await websocket.close(code=1011)
+                    return
+                async with upstream:
+                    await websocket.accept(subprotocol=upstream.subprotocol)
+                    await _pipe_websockets_bidirectionally(websocket, upstream)
+            finally:
+                pumps.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pumps
+        finally:
+            tunnel_side.close()
+            ws_side.close()
+
+
+async def _pump_local_socket_to_tunnel(
+    local_socket: socket.socket,
+    tunnel: websockets.ClientConnection,
+) -> None:
+    """Forward raw bytes from the inner WebSocket client out over the data channel."""
+    loop = asyncio.get_running_loop()
+    channel_prefix = bytes([_PORTFORWARD_DATA_CHANNEL])
+    try:
+        while True:
+            data = await loop.sock_recv(local_socket, _PORTFORWARD_READ_CHUNK_BYTES)
+            if not data:
+                break  # inner client closed its end; nothing more to forward
+            await tunnel.send(channel_prefix + data)
+    except (OSError, ws_exceptions.ConnectionClosed):
+        pass
+    finally:
+        # The inner client is done sending: close the tunnel so the API server
+        # tears down the connection to the Pod.
+        with contextlib.suppress(Exception):
+            await tunnel.close()
+
+
+async def _pump_tunnel_to_local_socket(
+    tunnel: websockets.ClientConnection,
+    local_socket: socket.socket,
+) -> None:
+    """Forward data-channel bytes from the Pod to the inner WebSocket client."""
+    loop = asyncio.get_running_loop()
+    data_channel_open = False
+    error_channel_open = False
+    try:
+        async for message in tunnel:
+            if not isinstance(message, (bytes, bytearray)) or not message:
+                continue
+            channel, payload = message[0], message[1:]
+            if channel == _PORTFORWARD_DATA_CHANNEL:
+                if not data_channel_open:
+                    # First data-channel frame is the port-number confirmation.
+                    data_channel_open = True
+                    continue
+                if payload:
+                    await loop.sock_sendall(local_socket, bytes(payload))
+            elif channel == _PORTFORWARD_ERROR_CHANNEL:
+                if not error_channel_open:
+                    # First error-channel frame is the port-number confirmation.
+                    error_channel_open = True
+                    continue
+                # A non-empty error frame means the forward failed; stop pumping.
+                break
+    except (OSError, ws_exceptions.ConnectionClosed):
+        pass
+    finally:
+        # Tunnel closed (or errored): give the inner client EOF so its read loop
+        # unblocks and the bidirectional pipe tears down.
+        with contextlib.suppress(OSError):
+            local_socket.shutdown(socket.SHUT_WR)
 
 
 async def _pipe_websockets_bidirectionally(
