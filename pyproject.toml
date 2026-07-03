@@ -1,0 +1,18 @@
+[project]
+name = "tangent"
+version = "0.1.0"
+description = "Tangent - AI Agent hosting for Tangle"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.138.2",
+    "httpx>=0.28.1",
+    "kubernetes>=36.0.2",
+    "pyjwt>=2.13.0",
+    "websockets>=16.0",
+]
+
+[dependency-groups]
+dev = [
+    "kubernetes-stubs-elephant-fork>=36.0.2",
+]
