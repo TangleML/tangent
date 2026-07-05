@@ -60,7 +60,7 @@ def build_api_router(
             instance_id: str,
             path: str,
             request: fastapi.Request,
-            user_id: str = fastapi.Depends(auth.get_current_user),
+            user_id: str = fastapi.Depends(get_user_name),
         ) -> fastapi.Response:
             file_path = (_OPENCODE_APP_STATIC_DIR / path).resolve()
             # Preventing path traversals
