@@ -5,7 +5,7 @@ import fastapi
 import httpx
 from kubernetes.client import api_client as k8s_client_lib
 
-from . import auth, kubernetes_proxy_utils
+from . import kubernetes_proxy_utils
 
 
 def build_api_router(
@@ -55,7 +55,7 @@ def build_api_router(
         port: int,
         path: str,
         request: fastapi.Request,
-        user_id: str = fastapi.Depends(auth.get_current_user),
+        user_id: str = fastapi.Depends(get_user_id),
     ) -> fastapi.Response:
         # TODO: ! Check whether the user is the owner!
         pod_name = _get_k8s_pod_name_for_instance(
@@ -97,7 +97,7 @@ def build_api_router(
         port: int,
         path: str,
         websocket: fastapi.WebSocket,
-        user_id: str = fastapi.Depends(auth.get_current_user),
+        user_id: str = fastapi.Depends(get_user_id),
     ):
         # TODO: ! Check whether the user is the owner!
         pod_name = _get_k8s_pod_name_for_instance(
