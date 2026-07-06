@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.1",
     "kubernetes>=36.0.2",
     "pyjwt>=2.13.0",
+    "uvicorn>=0.30",
     "websockets>=16.0",
 ]
 
